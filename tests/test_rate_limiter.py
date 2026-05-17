@@ -27,7 +27,7 @@ def test_rate_limiter_caps_unsafe_values() -> None:
     )
 
     assert limiter.max_concurrency == 5
-    assert limiter.requests_per_minute == 22
-    assert limiter.method_requests_per_minute == 15
-    assert limiter.request_sleep_min_seconds == 1.8
-    assert limiter.request_sleep_max_seconds == 1.8
+    assert limiter.requests_per_minute == 50
+    assert limiter.method_requests_per_minute == 40
+    assert limiter.request_sleep_min_seconds == 1.0
+    assert limiter.request_sleep_max_seconds == 1.0

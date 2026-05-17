@@ -116,24 +116,24 @@ class Settings(BaseSettings):
     @field_validator("requests_per_minute")
     @classmethod
     def cap_requests_per_minute(cls, value: int) -> int:
-        if value > 22:
-            LOGGER.warning("REQUESTS_PER_MINUTE=%s is risky for timeline crawling; capping to 22.", value)
-            return 22
+        if value > 50:
+            LOGGER.warning("REQUESTS_PER_MINUTE=%s exceeds Riot dev-key limit (100/2min); capping to 50.", value)
+            return 50
         return max(value, 1)
 
     @field_validator("method_requests_per_minute")
     @classmethod
     def cap_method_requests_per_minute(cls, value: int) -> int:
-        if value > 15:
-            LOGGER.warning("METHOD_REQUESTS_PER_MINUTE=%s is risky; capping to 15.", value)
-            return 15
+        if value > 40:
+            LOGGER.warning("METHOD_REQUESTS_PER_MINUTE=%s is risky; capping to 40.", value)
+            return 40
         return max(value, 1)
 
     @model_validator(mode="after")
     def validate_safety_bounds(self) -> "Settings":
-        if self.request_sleep_min_seconds < 1.8:
-            LOGGER.warning("REQUEST_SLEEP_MIN_SECONDS=%s is too low for timeline crawling; raising to 1.8.", self.request_sleep_min_seconds)
-            self.request_sleep_min_seconds = 1.8
+        if self.request_sleep_min_seconds < 1.0:
+            LOGGER.warning("REQUEST_SLEEP_MIN_SECONDS=%s is too low; raising to 1.0.", self.request_sleep_min_seconds)
+            self.request_sleep_min_seconds = 1.0
         if self.request_sleep_max_seconds < self.request_sleep_min_seconds:
             LOGGER.warning("REQUEST_SLEEP_MAX_SECONDS is below min; raising it to match REQUEST_SLEEP_MIN_SECONDS.")
             self.request_sleep_max_seconds = self.request_sleep_min_seconds

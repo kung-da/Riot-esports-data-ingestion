@@ -44,9 +44,9 @@ class RiotRateLimiter:
         circuit_breaker_cooldown_seconds: float = 300.0,
     ) -> None:
         self.max_concurrency = max(1, min(max_concurrency, 5))
-        self.requests_per_minute = max(1, min(requests_per_minute, 22))
-        self.method_requests_per_minute = max(1, min(method_requests_per_minute, 15))
-        self.request_sleep_min_seconds = max(request_sleep_min_seconds, 1.8)
+        self.requests_per_minute = max(1, min(requests_per_minute, 50))
+        self.method_requests_per_minute = max(1, min(method_requests_per_minute, 40))
+        self.request_sleep_min_seconds = max(request_sleep_min_seconds, 1.0)
         self.request_sleep_max_seconds = max(request_sleep_max_seconds, self.request_sleep_min_seconds)
         self.circuit_breaker_failure_threshold = max(circuit_breaker_failure_threshold, 1)
         self.circuit_breaker_cooldown_seconds = max(circuit_breaker_cooldown_seconds, 60.0)
