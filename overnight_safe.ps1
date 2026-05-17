@@ -13,8 +13,7 @@ try {
     python main.py crawl-overnight `
         --hours 8 `
         --target-matches 20000 `
-        --platform-region vn2 `
-        --skip-timelines $false 2>&1 | Tee-Object -FilePath $logFile -Append
+        --platform-region vn2 ` 2>&1 | Tee-Object -FilePath $logFile -Append
 
     "===== Processing data to CSV =====" | Tee-Object -FilePath $logFile -Append
     python main.py process 2>&1 | Tee-Object -FilePath $logFile -Append
