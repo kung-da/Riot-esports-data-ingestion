@@ -98,7 +98,9 @@ class RankedService:
                 summoner = await self.summoner_service.get_by_summoner_id(platform_region, summoner_id)
                 puuid = summoner.puuid if summoner else None
 
-            enriched = dict(entry_context, **raw_entry, puuid=puuid)
+            enriched = {**entry_context, **raw_entry}
+            if puuid:
+                enriched["puuid"] = puuid
             try:
                 entries.append(LeagueEntryDTO.model_validate(enriched))
             except ValidationError:

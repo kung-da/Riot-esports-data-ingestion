@@ -32,7 +32,7 @@ class MiniSeriesDTO(RiotBaseModel):
 
 class LeagueEntryDTO(RiotBaseModel):
     league_id: str | None = Field(default=None, alias="leagueId")
-    summoner_id: str = Field(alias="summonerId")
+    summoner_id: str | None = Field(default=None, alias="summonerId")
     puuid: str | None = None
     queue_type: str = Field(alias="queueType")
     tier: str
