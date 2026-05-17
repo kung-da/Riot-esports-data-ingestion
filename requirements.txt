@@ -1,0 +1,6 @@
+aiohttp>=3.9.5
+pandas>=2.2.2
+pydantic>=2.7.4
+pydantic-settings>=2.3.4
+python-dotenv>=1.0.1
+pytest>=8.2.2
