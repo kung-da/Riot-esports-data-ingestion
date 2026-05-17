@@ -1,5 +1,7 @@
 # overnight_safe.ps1
 # Safe overnight crawl cho i5-12450HX
+# Tắt sleep khi cắm điện
+powercfg /change standby-timeout-ac 0
 
 cd D:\Project\Riot-esports-data-ingestion
 
@@ -25,4 +27,6 @@ catch {
 }
 finally {
     "Script ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
+    
+    powercfg /change standby-timeout-ac 15
 }
