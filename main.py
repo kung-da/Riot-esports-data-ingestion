@@ -184,7 +184,7 @@ async def main_async() -> None:
         elif args.command == "crawl-leaderboard":
             await crawl_leaderboard(settings, args, ranked_service, match_service, timeline_service)
         elif args.command == "crawl-overnight":
-            await crawl_overnight(settings, args, ranked_service, match_service, timeline_service)
+            await crawl_overnight(settings, args, ranked_service, match_service, timeline_service, summoner_service)
         else:
             raise ValueError(f"Unsupported command: {args.command}")
 
@@ -267,6 +267,7 @@ async def crawl_overnight(
     ranked_service: RankedService,
     match_service: MatchService,
     timeline_service: TimelineService,
+    summoner_service: SummonerService,
 ) -> None:
     """Run batched safe overnight crawling for VN2."""
 
@@ -338,6 +339,9 @@ async def crawl_overnight(
         seed_index += 1
         start = offsets[puuid]
         offsets[puuid] = start + match_count
+
+        # Crawl summoner data cho mỗi seed PUUID
+        await summoner_service.get_by_puuid(platform_region, puuid)
 
         match_ids = await match_service.get_match_ids_for_puuid(
             routing_region,
