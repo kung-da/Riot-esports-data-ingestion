@@ -1,55 +1,15 @@
 # Riot-esports-data-ingestion
 
-Safe, incremental Riot Games crawler for daily runs with a rotated development API key. The project saves full raw JSON first, then rebuilds clean analytics-ready CSVs without duplicating already crawled matches.
+Safe incremental Riot Games crawler for VN2. It saves full raw Match Detail and Timeline JSON first, then rebuilds analytics-ready CSVs.
 
-## What This Project Prioritizes
+## Important Capacity Note
 
-- Easy API key rotation through `.env`
-- Strong checkpointing for daily incremental crawls
-- No duplicate match detail requests
-- Conservative Riot API usage for development keys
-- Clean raw and processed data for analytics and ML
+With full data (`match detail + timeline`) each match costs at least 2 Riot API requests. At the safe overnight setting of about 20 requests/minute:
 
-## Project Structure
+- 8 hours ~= 9,600 requests ~= 4,300 safe full matches after overhead
+- 10 hours ~= 12,000 requests ~= 5,400 safe full matches after overhead
 
-```text
-Riot-esports-data-ingestion/
-|-- requirements.txt
-|-- .env.example
-|-- README.md
-|-- main.py
-|-- crawler/
-|   |-- config/
-|   |   `-- settings.py
-|   |-- utils/
-|   |   |-- checkpoint.py
-|   |   |-- rate_limiter.py
-|   |   |-- retry.py
-|   |   |-- logger.py
-|   |   `-- helpers.py
-|   |-- api/
-|   |   `-- riot_client.py
-|   |-- schemas/
-|   |   `-- models.py
-|   `-- services/
-|       |-- summoner_service.py
-|       |-- match_service.py
-|       |-- ranked_service.py
-|       `-- timeline_service.py
-|-- output/
-|   |-- raw/
-|   |   |-- summoners/
-|   |   |-- matches/
-|   |   |-- timelines/
-|   |   `-- ranked/
-|   `-- processed/
-|       |-- players.csv
-|       |-- matches.csv
-|       |-- ranked.csv
-|       `-- timelines.csv
-|-- checkpoints/
-`-- tests/
-```
+The CLI accepts `--target-matches 20000`, but the crawler will log a warning and stop by the time limit rather than forcing unsafe speed. To reach 15,000-25,000 full matches/day with a development key, run longer windows, rotate keys responsibly, or use an approved production key with documented higher limits.
 
 ## Setup
 
@@ -66,78 +26,89 @@ Set your current Riot key in `.env`:
 RIOT_API_KEY=RGAPI-your-current-daily-key
 ```
 
-To rotate the key each day, only replace `RIOT_API_KEY`. Checkpoints and raw JSON stay unchanged, so old matches are not crawled again.
+To rotate the key daily, replace only `RIOT_API_KEY`. Raw JSON and checkpoints stay unchanged.
 
 ## Safe Defaults
 
 ```text
-MAX_CONCURRENCY=6
-REQUESTS_PER_MINUTE=40
-METHOD_REQUESTS_PER_MINUTE=20
-REQUEST_SLEEP_MIN_SECONDS=1.2
-REQUEST_SLEEP_MAX_SECONDS=1.8
-RETRY_ATTEMPTS=5
-RETRY_BASE_DELAY_SECONDS=1.0
-CIRCUIT_BREAKER_FAILURE_THRESHOLD=5
-CIRCUIT_BREAKER_COOLDOWN_SECONDS=300
-USER_AGENT=RiotDataCrawler/1.0 (Personal Educational Project)
+MAX_CONCURRENCY=5
+REQUESTS_PER_MINUTE=20
+METHOD_REQUESTS_PER_MINUTE=12
+REQUEST_SLEEP_MIN_SECONDS=1.8
+REQUEST_SLEEP_MAX_SECONDS=3.5
+OVERNIGHT_BATCH_SIZE=1000
+OVERNIGHT_BATCH_SLEEP_MIN_SECONDS=480
+OVERNIGHT_BATCH_SLEEP_MAX_SECONDS=900
+OVERNIGHT_INCLUDE_TIMELINES=true
 ```
 
-The code caps risky values and logs a warning if configuration is too aggressive.
+The limiter uses global, per-region, and per-method windows, exponential backoff with jitter, circuit breaker, and preemptive slowdown from Riot rate-limit headers.
 
-## Daily Crawl by PUUID
+## Commands
+
+Crawl a single leaderboard tier:
 
 ```bash
-python main.py crawl-puuids --puuids <puuid1> <puuid2> --platform-region vn2 --match-count 30 --skip-timelines
+python main.py crawl-leaderboard --platform-region vn2 --tier CHALLENGER --limit 50 --match-count 20
 ```
 
-Without `--skip-timelines`, timelines are crawled sequentially after new matches with an extra delay.
-
-## Crawl from Ranked Leaderboard
+Crawl all top tiers configured in `.env`:
 
 ```bash
-python main.py crawl-leaderboard --platform-region vn2 --tier MASTER --limit 10 --match-count 10
+python main.py crawl-leaderboard --platform-region vn2 --tier ALL --limit 50 --match-count 20
 ```
 
-Keep leaderboard limits small when using a development key.
+Run overnight safe mode:
 
-## Rebuild Processed CSVs
+```bash
+python main.py crawl-overnight --hours 8 --target-matches 20000
+```
+
+Rebuild processed CSVs:
 
 ```bash
 python main.py process
 ```
 
-This rebuilds processed CSVs from raw JSON only. It does not call Riot API.
+PowerShell wrapper:
 
-## Incremental Behavior
+```powershell
+.\overnight_crawl.ps1
+```
 
-Before calling match detail, the crawler checks:
+## Incremental Guarantees
+
+Before calling Match Detail, the crawler checks:
 
 - `output/raw/matches/<match_id>.json`
 - `checkpoints/matches.json`
 
-If either exists, the match detail API call is skipped. After every successful raw match save, the match ID is immediately written to the checkpoint.
-
-Timeline calls use the same pattern with:
+Before calling Timeline, it checks:
 
 - `output/raw/timelines/<match_id>.json`
 - `checkpoints/timelines.json`
 
-## Outputs
+After every successful raw save, the checkpoint is updated immediately. Re-running the same crawl does not duplicate match detail or timeline API calls.
+
+## Output
 
 Raw JSON:
 
 - `output/raw/summoners/`
+- `output/raw/ranked/`
 - `output/raw/matches/`
 - `output/raw/timelines/`
-- `output/raw/ranked/`
 
 Processed CSV:
 
 - `output/processed/players.csv`
 - `output/processed/matches.csv`
-- `output/processed/ranked.csv`
 - `output/processed/timelines.csv`
+- `output/processed/ranked.csv`
+
+Logs:
+
+- `logs/<command>_YYYYMMDD_HHMMSS.log`
 
 ## Tests
 

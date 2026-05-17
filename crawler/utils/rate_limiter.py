@@ -43,10 +43,10 @@ class RiotRateLimiter:
         circuit_breaker_failure_threshold: int = 5,
         circuit_breaker_cooldown_seconds: float = 300.0,
     ) -> None:
-        self.max_concurrency = max(1, min(max_concurrency, 8))
-        self.requests_per_minute = max(1, min(requests_per_minute, 50))
-        self.method_requests_per_minute = max(1, min(method_requests_per_minute, 30))
-        self.request_sleep_min_seconds = max(request_sleep_min_seconds, 1.2)
+        self.max_concurrency = max(1, min(max_concurrency, 5))
+        self.requests_per_minute = max(1, min(requests_per_minute, 22))
+        self.method_requests_per_minute = max(1, min(method_requests_per_minute, 15))
+        self.request_sleep_min_seconds = max(request_sleep_min_seconds, 1.8)
         self.request_sleep_max_seconds = max(request_sleep_max_seconds, self.request_sleep_min_seconds)
         self.circuit_breaker_failure_threshold = max(circuit_breaker_failure_threshold, 1)
         self.circuit_breaker_cooldown_seconds = max(circuit_breaker_cooldown_seconds, 60.0)
@@ -124,6 +124,22 @@ class RiotRateLimiter:
                 state.consecutive_failures = 0
                 if state.throttle_factor < 1.0:
                     state.throttle_factor = min(1.0, state.throttle_factor + 0.02)
+
+    async def soft_throttle(self, region: str, method_key: str, usage_ratio: float, cooldown_seconds: float = 5.0) -> None:
+        """Reduce speed before a hard 429 when Riot headers show high usage."""
+
+        state = await self._state(region)
+        async with self._traffic_lock:
+            state.throttle_factor = max(0.4, min(state.throttle_factor, 1.0 - min(usage_ratio - 0.80, 0.35)))
+            state.circuit_open_until = max(state.circuit_open_until, time.monotonic() + cooldown_seconds)
+        LOGGER.warning(
+            "Preemptive throttle region=%s method=%s usage=%.0f%% throttle=%.0f%% cooldown=%.1fs",
+            region,
+            method_key,
+            usage_ratio * 100,
+            state.throttle_factor * 100,
+            cooldown_seconds,
+        )
 
     async def _state(self, region: str) -> RegionLimiterState:
         normalized = region.lower()

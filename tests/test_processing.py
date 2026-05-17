@@ -1,4 +1,4 @@
-from crawler.schemas.models import MatchDTO, TimelineDTO
+from crawler.schemas.models import MatchDTO, SummonerDTO, TimelineDTO
 from crawler.services.match_service import MatchService
 from crawler.services.timeline_service import TimelineService
 
@@ -80,3 +80,17 @@ def test_timeline_processing_expands_kill_death_assist_rows() -> None:
     assert [record["event_category"] for record in records] == ["kill", "death", "assist"]
     assert records[0]["position_x"] == 1000
     assert records[2]["participant_id"] == 3
+
+
+def test_summoner_payload_without_encrypted_id_is_valid() -> None:
+    payload = {
+        "puuid": "sample-puuid",
+        "profileIconId": 1,
+        "revisionDate": 1710000000000,
+        "summonerLevel": 71,
+    }
+
+    summoner = SummonerDTO.model_validate(payload)
+
+    assert summoner.id is None
+    assert summoner.puuid == "sample-puuid"

@@ -32,6 +32,13 @@ class RankedService:
     ) -> list[LeagueEntryDTO]:
         """Fetch ranked entries for a single summoner."""
 
+        if not summoner.id:
+            LOGGER.info(
+                "Skipping ranked lookup for puuid=%s because Riot summoner payload did not include encrypted summoner id.",
+                summoner.puuid,
+            )
+            return []
+
         try:
             raw = await self.client.get_ranked_entries_by_summoner_id(platform_region, summoner.id)
             await write_json(self.raw_dir / f"{safe_filename(summoner.puuid)}.json", raw)

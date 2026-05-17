@@ -14,3 +14,4 @@ build/
 output/raw/**/*.json
 output/processed/*.csv
 checkpoints/*.json
+logs/*.log

@@ -14,7 +14,7 @@ class RiotBaseModel(BaseModel):
 
 
 class SummonerDTO(RiotBaseModel):
-    id: str
+    id: str | None = None
     account_id: str | None = Field(default=None, alias="accountId")
     puuid: str
     name: str | None = None

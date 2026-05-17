@@ -41,11 +41,11 @@ class Settings(BaseSettings):
     regions: str = Field(default="vn2", alias="REGIONS")
 
     request_timeout_seconds: float = Field(default=30.0, alias="REQUEST_TIMEOUT_SECONDS")
-    max_concurrency: int = Field(default=6, alias="MAX_CONCURRENCY")
-    requests_per_minute: int = Field(default=40, alias="REQUESTS_PER_MINUTE")
-    method_requests_per_minute: int = Field(default=20, alias="METHOD_REQUESTS_PER_MINUTE")
-    request_sleep_min_seconds: float = Field(default=1.2, alias="REQUEST_SLEEP_MIN_SECONDS")
-    request_sleep_max_seconds: float = Field(default=1.8, alias="REQUEST_SLEEP_MAX_SECONDS")
+    max_concurrency: int = Field(default=5, alias="MAX_CONCURRENCY")
+    requests_per_minute: int = Field(default=20, alias="REQUESTS_PER_MINUTE")
+    method_requests_per_minute: int = Field(default=12, alias="METHOD_REQUESTS_PER_MINUTE")
+    request_sleep_min_seconds: float = Field(default=1.8, alias="REQUEST_SLEEP_MIN_SECONDS")
+    request_sleep_max_seconds: float = Field(default=3.5, alias="REQUEST_SLEEP_MAX_SECONDS")
 
     retry_attempts: int = Field(default=5, alias="RETRY_ATTEMPTS")
     retry_base_delay_seconds: float = Field(default=1.0, alias="RETRY_BASE_DELAY_SECONDS")
@@ -59,8 +59,18 @@ class Settings(BaseSettings):
         alias="USER_AGENT",
     )
     default_match_count: int = Field(default=10, alias="DEFAULT_MATCH_COUNT")
+    overnight_target_matches: int = Field(default=20000, alias="OVERNIGHT_TARGET_MATCHES")
+    overnight_hours: float = Field(default=8.0, alias="OVERNIGHT_HOURS")
+    overnight_batch_size: int = Field(default=1000, alias="OVERNIGHT_BATCH_SIZE")
+    overnight_batch_sleep_min_seconds: int = Field(default=480, alias="OVERNIGHT_BATCH_SLEEP_MIN_SECONDS")
+    overnight_batch_sleep_max_seconds: int = Field(default=900, alias="OVERNIGHT_BATCH_SLEEP_MAX_SECONDS")
+    overnight_leaderboard_limit_per_tier: int = Field(default=50, alias="OVERNIGHT_LEADERBOARD_LIMIT_PER_TIER")
+    overnight_match_count_per_puuid: int = Field(default=20, alias="OVERNIGHT_MATCH_COUNT_PER_PUUID")
+    overnight_include_timelines: bool = Field(default=True, alias="OVERNIGHT_INCLUDE_TIMELINES")
+    overnight_tiers: str = Field(default="CHALLENGER,GRANDMASTER,MASTER,DIAMOND:I", alias="OVERNIGHT_TIERS")
     output_dir: Path = Field(default=Path("output"), alias="OUTPUT_DIR")
     checkpoint_dir: Path = Field(default=Path("checkpoints"), alias="CHECKPOINT_DIR")
+    log_dir: Path = Field(default=Path("logs"), alias="LOG_DIR")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     model_config = SettingsConfigDict(
@@ -98,32 +108,32 @@ class Settings(BaseSettings):
     @field_validator("max_concurrency")
     @classmethod
     def cap_max_concurrency(cls, value: int) -> int:
-        if value > 8:
-            LOGGER.warning("MAX_CONCURRENCY=%s is too high for safe Riot crawling; capping to 8.", value)
-            return 8
+        if value > 5:
+            LOGGER.warning("MAX_CONCURRENCY=%s is too high for overnight timeline crawling; capping to 5.", value)
+            return 5
         return max(value, 1)
 
     @field_validator("requests_per_minute")
     @classmethod
     def cap_requests_per_minute(cls, value: int) -> int:
-        if value > 50:
-            LOGGER.warning("REQUESTS_PER_MINUTE=%s is risky for a development key; capping to 50.", value)
-            return 50
+        if value > 22:
+            LOGGER.warning("REQUESTS_PER_MINUTE=%s is risky for timeline crawling; capping to 22.", value)
+            return 22
         return max(value, 1)
 
     @field_validator("method_requests_per_minute")
     @classmethod
     def cap_method_requests_per_minute(cls, value: int) -> int:
-        if value > 30:
-            LOGGER.warning("METHOD_REQUESTS_PER_MINUTE=%s is risky; capping to 30.", value)
-            return 30
+        if value > 15:
+            LOGGER.warning("METHOD_REQUESTS_PER_MINUTE=%s is risky; capping to 15.", value)
+            return 15
         return max(value, 1)
 
     @model_validator(mode="after")
     def validate_safety_bounds(self) -> "Settings":
-        if self.request_sleep_min_seconds < 1.2:
-            LOGGER.warning("REQUEST_SLEEP_MIN_SECONDS=%s is too low; raising to 1.2.", self.request_sleep_min_seconds)
-            self.request_sleep_min_seconds = 1.2
+        if self.request_sleep_min_seconds < 1.8:
+            LOGGER.warning("REQUEST_SLEEP_MIN_SECONDS=%s is too low for timeline crawling; raising to 1.8.", self.request_sleep_min_seconds)
+            self.request_sleep_min_seconds = 1.8
         if self.request_sleep_max_seconds < self.request_sleep_min_seconds:
             LOGGER.warning("REQUEST_SLEEP_MAX_SECONDS is below min; raising it to match REQUEST_SLEEP_MIN_SECONDS.")
             self.request_sleep_max_seconds = self.request_sleep_min_seconds
@@ -138,6 +148,17 @@ class Settings(BaseSettings):
         if self.timeline_extra_delay_seconds < 2.0:
             LOGGER.warning("TIMELINE_EXTRA_DELAY_SECONDS=%s is low; raising to 2.0.", self.timeline_extra_delay_seconds)
             self.timeline_extra_delay_seconds = 2.0
+        if self.overnight_batch_size < 100:
+            LOGGER.warning("OVERNIGHT_BATCH_SIZE=%s is very small; raising to 100.", self.overnight_batch_size)
+            self.overnight_batch_size = 100
+        if self.overnight_batch_size > 1200:
+            LOGGER.warning("OVERNIGHT_BATCH_SIZE=%s is high; capping to 1200.", self.overnight_batch_size)
+            self.overnight_batch_size = 1200
+        if self.overnight_batch_sleep_min_seconds < 480:
+            LOGGER.warning("OVERNIGHT_BATCH_SLEEP_MIN_SECONDS=%s is low; raising to 480.", self.overnight_batch_sleep_min_seconds)
+            self.overnight_batch_sleep_min_seconds = 480
+        if self.overnight_batch_sleep_max_seconds < self.overnight_batch_sleep_min_seconds:
+            self.overnight_batch_sleep_max_seconds = self.overnight_batch_sleep_min_seconds
         return self
 
     @property
@@ -145,6 +166,22 @@ class Settings(BaseSettings):
         """Configured platform regions as a normalized list."""
 
         return [item.strip().lower() for item in self.regions.split(",") if item.strip()]
+
+    @property
+    def overnight_tier_plan(self) -> list[tuple[str, str]]:
+        """Return overnight leaderboard tiers as `(tier, division)` pairs."""
+
+        plan: list[tuple[str, str]] = []
+        for item in self.overnight_tiers.split(","):
+            value = item.strip().upper()
+            if not value:
+                continue
+            if ":" in value:
+                tier, division = value.split(":", 1)
+                plan.append((tier.strip(), division.strip() or "I"))
+            else:
+                plan.append((value, "I"))
+        return plan or [("CHALLENGER", "I"), ("GRANDMASTER", "I"), ("MASTER", "I"), ("DIAMOND", "I")]
 
     def routing_region_for_platform(self, platform_region: str | None = None) -> str:
         """Return Riot Match-V5 routing region for a platform shard."""

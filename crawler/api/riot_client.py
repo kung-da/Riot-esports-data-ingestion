@@ -123,6 +123,7 @@ class RiotClient:
                     async with self.session.request(method, url, headers=headers) as response:
                         payload = await self._read_payload(response)
                         await self.rate_limiter.record_response(normalized_region, limiter_key, response.status)
+                        await self._apply_header_safety(normalized_region, limiter_key, response.headers)
                         LOGGER.info(
                             "Riot response status=%s region=%s method=%s path=%s",
                             response.status,
@@ -309,3 +310,39 @@ class RiotClient:
             if payload.get("text"):
                 return str(payload["text"])
         return "request failed"
+
+    async def _apply_header_safety(self, region: str, method_key: str, headers: Mapping[str, str]) -> None:
+        """Slow down preemptively when Riot rate-limit headers approach the configured limit."""
+
+        ratios = []
+        app_ratio = self._header_usage_ratio(headers.get("X-App-Rate-Limit"), headers.get("X-App-Rate-Limit-Count"))
+        method_ratio = self._header_usage_ratio(headers.get("X-Method-Rate-Limit"), headers.get("X-Method-Rate-Limit-Count"))
+        if app_ratio is not None:
+            ratios.append(app_ratio)
+        if method_ratio is not None:
+            ratios.append(method_ratio)
+        if not ratios:
+            return
+
+        usage_ratio = max(ratios)
+        if usage_ratio >= 0.85:
+            await self.rate_limiter.soft_throttle(region, method_key, usage_ratio, cooldown_seconds=5.0)
+
+    @staticmethod
+    def _header_usage_ratio(limit_header: str | None, count_header: str | None) -> float | None:
+        if not limit_header or not count_header:
+            return None
+        ratios: list[float] = []
+        for limit_part, count_part in zip(limit_header.split(","), count_header.split(","), strict=False):
+            try:
+                limit_value, limit_window = limit_part.split(":", 1)
+                count_value, count_window = count_part.split(":", 1)
+                if limit_window != count_window:
+                    continue
+                limit = float(limit_value)
+                count = float(count_value)
+            except ValueError:
+                continue
+            if limit > 0:
+                ratios.append(count / limit)
+        return max(ratios) if ratios else None
