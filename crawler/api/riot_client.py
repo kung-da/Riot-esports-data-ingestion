@@ -65,7 +65,11 @@ class RiotClient:
 
     async def __aenter__(self) -> "RiotClient":
         if self._session is None:
-            timeout = aiohttp.ClientTimeout(total=self.settings.request_timeout_seconds)
+            timeout = aiohttp.ClientTimeout(
+                total=self.settings.request_timeout_seconds,
+                connect=10.0,
+                sock_read=15.0,
+            )
             connector = aiohttp.TCPConnector(limit=self.settings.max_concurrency)
             self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self
