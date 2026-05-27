@@ -66,7 +66,7 @@ A safe, incremental, async crawler for Riot Games esports data on the **VN2** se
 │       └── ranked.csv
 ├── tests/
 ├── main.py                       # CLI entrypoint
-├── overnight_crawl.ps1           # PowerShell wrapper for overnight mode
+├── overnight_safe.ps1           # PowerShell wrapper for overnight mode
 ├── requirements.txt
 ├── pytest.ini
 └── .env.example
