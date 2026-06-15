@@ -1,179 +1,350 @@
 # Riot Esports Data Ingestion
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
-![Async](https://img.shields.io/badge/async-asyncio-green)
-![Region](https://img.shields.io/badge/region-VN2-red)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
+![AsyncIO](https://img.shields.io/badge/asyncio-aiohttp-green)
+![Riot API](https://img.shields.io/badge/Riot_API-Match--V5_%7C_League--V4-red)
+![Tests](https://img.shields.io/badge/tests-7_passed-brightgreen)
 
-A safe, incremental, async crawler for Riot Games esports data on the **VN2** server. Saves full raw Match Detail and Timeline JSON first, then rebuilds analytics-ready CSVs — without ever duplicating an API call.
+Crawler bất đồng bộ dùng Riot Games API để thu thập dữ liệu người chơi, xếp hạng,
+trận đấu và timeline. Dự án ưu tiên lưu JSON gốc trước, hỗ trợ chạy nối tiếp an
+toàn bằng checkpoint, sau đó chuyển đổi dữ liệu thành CSV phục vụ phân tích.
 
----
+Mặc định dự án hướng đến máy chủ Việt Nam (`vn2`), nhưng các lệnh thông thường
+vẫn hỗ trợ nhiều platform region khác. Riêng chế độ `crawl-overnight` được khóa
+ở `vn2`.
 
-## Table of Contents
+## Mục lục
 
-- [Features](#features)
-- [Project Structure](#project-structure)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-  - [crawl-puuids](#crawl-puuids)
-  - [crawl-leaderboard](#crawl-leaderboard)
-  - [crawl-overnight](#crawl-overnight)
-  - [process](#process)
-- [Architecture & Data Flow](#architecture--data-flow)
-- [Capacity Planning](#capacity-planning)
-- [Output Schema](#output-schema)
-- [Incremental Guarantees](#incremental-guarantees)
-- [Testing](#testing)
-- [Contributing](#contributing)
+- [Tính năng chính](#tính-năng-chính)
+- [Kiến trúc và luồng dữ liệu](#kiến-trúc-và-luồng-dữ-liệu)
+- [Cấu trúc dự án](#cấu-trúc-dự-án)
+- [Yêu cầu hệ thống](#yêu-cầu-hệ-thống)
+- [Cài đặt nhanh](#cài-đặt-nhanh)
+- [Cấu hình](#cấu-hình)
+- [Cách sử dụng](#cách-sử-dụng)
+- [Dữ liệu đầu ra](#dữ-liệu-đầu-ra)
+- [Checkpoint và khả năng chạy lại](#checkpoint-và-khả-năng-chạy-lại)
+- [Rate limit, retry và ước tính công suất](#rate-limit-retry-và-ước-tính-công-suất)
+- [Kiểm thử](#kiểm-thử)
+- [Xử lý sự cố](#xử-lý-sự-cố)
+- [Lưu ý bảo mật và sử dụng API](#lưu-ý-bảo-mật-và-sử-dụng-api)
 
----
+## Tính năng chính
 
-## Features
+- Thu thập dữ liệu qua Riot Summoner-V4, League-V4 và Match-V5.
+- Hỗ trợ crawl theo danh sách PUUID hoặc seed người chơi từ leaderboard.
+- Lưu nguyên JSON phản hồi trước khi validate và chuyển đổi.
+- Bỏ qua match/timeline đã có bằng cả raw file và checkpoint.
+- Tự khôi phục checkpoint từ các raw file hiện có khi khởi động.
+- Giới hạn request theo toàn cục, region và từng nhóm API method.
+- Đọc rate-limit header của Riot để giảm tốc trước khi gặp HTTP `429`.
+- Retry theo exponential backoff cho `429`, `503`, `504`.
+- Circuit breaker tạm dừng region khi lỗi retryable xảy ra liên tiếp.
+- Chạy theo batch trong chế độ overnight và tự dừng khi hết thời gian.
+- Xuất CSV có schema cố định, sắp xếp và loại bản ghi trùng lặp.
+- Có thể dựng lại toàn bộ CSV từ raw JSON mà không gọi Riot API.
 
-- **Raw-first**: Full Match Detail and Timeline JSON are persisted before any processing
-- **Incremental**: Checkpoint files and raw file presence checks prevent duplicate API calls on re-runs
-- **Rate-limit safe**: Global + per-method windows, exponential backoff with jitter, circuit breaker, and preemptive slowdown from Riot response headers
-- **Overnight mode**: Batched crawling with configurable sleep windows, designed for unattended overnight runs
-- **Leaderboard seeding**: Auto-discovers top players from Challenger / Grandmaster / Master / Diamond leaderboards
-- **Flexible CLI**: Four subcommands covering targeted PUUID crawls, leaderboard-driven crawls, overnight batching, and CSV rebuild
-- **Deterministic CSV output**: Sorted, deduplicated, schema-pinned CSVs with headers even when empty
+## Kiến trúc và luồng dữ liệu
 
----
-
-## Project Structure
-
+```text
+PUUID truyền từ CLI hoặc League-V4 leaderboard
+                         |
+                         v
+                 Summoner-V4 profile
+                         |
+                         +--------> League-V4 ranked data
+                         |
+                         v
+                 Match-V5 match IDs
+                         |
+                  kiểm tra checkpoint
+                  và raw file hiện có
+                         |
+                         v
+                 Match-V5 match detail
+                         |
+                         v
+              output/raw/matches/*.json
+                         |
+                         v
+                 Match-V5 timeline
+                         |
+                         v
+             output/raw/timelines/*.json
+                         |
+                         v
+                 python main.py process
+                         |
+          +--------------+---------------+
+          |              |               |
+     players.csv     matches.csv     timelines.csv
+                         |
+                     ranked.csv
 ```
+
+Các thành phần chính:
+
+| Thành phần | Trách nhiệm |
+|---|---|
+| `RiotClient` | Gọi HTTP bất đồng bộ, gắn API key, retry và xử lý lỗi |
+| `RiotRateLimiter` | Giới hạn concurrency, request/phút, cooldown và circuit breaker |
+| `SummonerService` | Thu thập và lưu hồ sơ summoner |
+| `RankedService` | Thu thập ranked entry và leaderboard |
+| `MatchService` | Lấy match ID, lưu match detail mới và tạo record phân tích |
+| `TimelineService` | Lưu timeline mới và chuẩn hóa event |
+| `CheckpointManager` | Theo dõi match/timeline đã lưu bằng JSON checkpoint |
+| `process_raw_to_csv()` | Đọc raw JSON, validate bằng Pydantic và xuất CSV |
+
+## Cấu trúc dự án
+
+```text
 .
-├── checkpoints/                  # Checkpoint JSON — tracks saved matches & timelines
-├── crawler/                      # Core package
-│   ├── api/                      #   RiotClient (async HTTP, rate limiter)
-│   ├── config/                   #   Settings (pydantic, .env)
-│   ├── schemas/                  #   Pydantic models: MatchDTO, TimelineDTO, etc.
-│   ├── services/                 #   MatchService, TimelineService, RankedService, SummonerService
-│   └── utils/                    #   CheckpointManager, helpers, logger
-├── logs/                         # Per-run log files: <command>_YYYYMMDD_HHMMSS.log
-├── output/
-│   ├── raw/
-│   │   ├── summoners/
-│   │   ├── matches/
-│   │   ├── timelines/
-│   │   └── ranked/
-│   └── processed/
-│       ├── players.csv
-│       ├── matches.csv
-│       ├── timelines.csv
-│       └── ranked.csv
-├── tests/
-├── main.py                       # CLI entrypoint
-├── overnight_safe.ps1           # PowerShell wrapper for overnight mode
-├── requirements.txt
-├── pytest.ini
-└── .env.example
+|-- crawler/
+|   |-- api/
+|   |   `-- riot_client.py
+|   |-- config/
+|   |   `-- settings.py
+|   |-- schemas/
+|   |   `-- models.py
+|   |-- services/
+|   |   |-- match_service.py
+|   |   |-- ranked_service.py
+|   |   |-- summoner_service.py
+|   |   `-- timeline_service.py
+|   `-- utils/
+|       |-- checkpoint.py
+|       |-- helpers.py
+|       |-- logger.py
+|       |-- rate_limiter.py
+|       `-- retry.py
+|-- checkpoints/              # matches.json và timelines.json khi chạy
+|-- logs/                     # log riêng cho từng lần chạy
+|-- output/
+|   |-- raw/
+|   |   |-- matches/
+|   |   |-- ranked/
+|   |   |-- summoners/
+|   |   `-- timelines/
+|   `-- processed/            # bốn file CSV được sinh ra
+|-- tests/
+|-- main.py                   # CLI và bước xử lý CSV
+|-- overnight_safe.ps1        # wrapper PowerShell cho crawl qua đêm
+|-- requirements.txt
+|-- pytest.ini
+`-- .env.example
 ```
 
----
+`output/`, `checkpoints/` và `logs/` được tạo tự động nếu chưa tồn tại. Dữ liệu
+sinh ra trong các thư mục này không được commit theo cấu hình `.gitignore`.
 
-## Installation
+## Yêu cầu hệ thống
+
+- Python 3.10 trở lên.
+- Riot Games API key còn hiệu lực.
+- Kết nối mạng đến `*.api.riotgames.com`.
+- Dung lượng đĩa đủ lớn nếu thu timeline. Timeline JSON và CSV có thể lớn hơn
+  đáng kể so với match detail.
+- PowerShell và quyền thay đổi power plan nếu dùng `overnight_safe.ps1`.
+
+## Cài đặt nhanh
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/kung-da/Riot-esports-data-ingestion.git
 cd Riot-esports-data-ingestion
 
-# 2. Create and activate a virtual environment
 python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Copy the example env file
-copy .env.example .env       # Windows
-cp .env.example .env         # macOS / Linux
 ```
 
-Open `.env` and set your Riot API key:
+Kích hoạt virtual environment:
+
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+```
+
+```bash
+# macOS/Linux
+source .venv/bin/activate
+```
+
+Cài dependency:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Tạo file cấu hình:
+
+```powershell
+# Windows PowerShell
+Copy-Item .env.example .env
+```
+
+```bash
+# macOS/Linux
+cp .env.example .env
+```
+
+Sau đó cập nhật API key trong `.env`:
 
 ```env
-RIOT_API_KEY=RGAPI-your-current-daily-key
+RIOT_API_KEY=RGAPI-your-api-key
 ```
 
-> **Key rotation**: To use a new daily key, replace only `RIOT_API_KEY`. All raw JSON files and checkpoints remain unchanged.
+Kiểm tra CLI:
 
----
+```bash
+python main.py --help
+```
 
-## Configuration
+## Cấu hình
 
-All settings are read from `.env` (or environment variables). The defaults below are tuned for safe overnight crawling with a Riot development key.
+Cấu hình được đọc từ biến môi trường và file `.env` bằng
+`pydantic-settings`. Biến môi trường hệ thống có thể ghi đè giá trị trong file.
 
-| Variable | Default | Description |
-|---|---|---|
-| `RIOT_API_KEY` | *(required)* | Your Riot Games API key |
-| `MAX_CONCURRENCY` | `5` | Max simultaneous async requests |
-| `REQUESTS_PER_MINUTE` | `20` | Global request cap per minute |
-| `METHOD_REQUESTS_PER_MINUTE` | `12` | Per-method request cap per minute |
-| `REQUEST_SLEEP_MIN_SECONDS` | `1.8` | Minimum sleep between requests |
-| `REQUEST_SLEEP_MAX_SECONDS` | `3.5` | Maximum sleep between requests |
-| `OVERNIGHT_BATCH_SIZE` | `1000` | New matches per batch before sleeping |
-| `OVERNIGHT_BATCH_SLEEP_MIN_SECONDS` | `480` | Minimum inter-batch sleep (8 min) |
-| `OVERNIGHT_BATCH_SLEEP_MAX_SECONDS` | `900` | Maximum inter-batch sleep (15 min) |
-| `OVERNIGHT_INCLUDE_TIMELINES` | `true` | Whether to collect timelines overnight |
+### Kết nối và region
 
-The rate limiter enforces **global**, **per-region**, and **per-method** windows simultaneously, and reads `X-Rate-Limit-Count` / `Retry-After` headers to preemptively slow down before hitting a 429.
+| Biến | Giá trị trong `.env.example` | Ý nghĩa |
+|---|---:|---|
+| `RIOT_API_KEY` | bắt buộc | Riot API key |
+| `DEFAULT_PLATFORM_REGION` | `vn2` | Platform shard mặc định |
+| `DEFAULT_ROUTING_REGION` | rỗng | Ghi đè routing region; để rỗng để tự ánh xạ |
+| `REGIONS` | `vn2` | Danh sách platform region, phân tách bằng dấu phẩy |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Tổng timeout cho một request |
+| `USER_AGENT` | `RiotDataCrawler/1.0...` | User-Agent gửi đến Riot API |
 
----
+Ánh xạ platform sang routing region:
 
-## Usage
+| Routing region | Platform region |
+|---|---|
+| `americas` | `br1`, `la1`, `la2`, `na1` |
+| `asia` | `jp1`, `kr` |
+| `europe` | `eun1`, `euw1`, `ru`, `tr1` |
+| `sea` | `oc1`, `ph2`, `sg2`, `th2`, `tw2`, `vn2` |
 
-### crawl-puuids
+### Rate limit và retry
 
-Crawl match history and ranked data for one or more specific PUUIDs.
+| Biến | Giá trị trong `.env.example` | Ý nghĩa |
+|---|---:|---|
+| `MAX_CONCURRENCY` | `5` | Số request đồng thời tối đa |
+| `REQUESTS_PER_MINUTE` | `45` | Giới hạn request toàn cục mỗi phút |
+| `METHOD_REQUESTS_PER_MINUTE` | `40` | Giới hạn mỗi nhóm API method mỗi phút |
+| `REQUEST_SLEEP_MIN_SECONDS` | `0.8` | Khoảng nghỉ ngẫu nhiên tối thiểu |
+| `REQUEST_SLEEP_MAX_SECONDS` | `1.5` | Khoảng nghỉ ngẫu nhiên tối đa |
+| `RETRY_ATTEMPTS` | `5` | Số lần thử tối đa |
+| `RETRY_BASE_DELAY_SECONDS` | `1.0` | Delay nền cho exponential backoff |
+| `RETRY_MAX_DELAY_SECONDS` | `60` | Delay retry tối đa |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Số lỗi liên tiếp trước khi mở circuit |
+| `CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `300` | Thời gian circuit breaker tạm dừng |
+| `TIMELINE_EXTRA_DELAY_SECONDS` | `2.0` | Delay thêm trước mỗi timeline request |
+
+Ứng dụng tự ép các ngưỡng an toàn:
+
+- `MAX_CONCURRENCY` không vượt quá `5`.
+- `REQUESTS_PER_MINUTE` không vượt quá `50`.
+- `METHOD_REQUESTS_PER_MINUTE` không vượt quá `40`.
+- `REQUEST_SLEEP_MIN_SECONDS` không thấp hơn `1.0`.
+- `RETRY_ATTEMPTS` không vượt quá `5`.
+- `TIMELINE_EXTRA_DELAY_SECONDS` không thấp hơn `2.0`.
+
+Vì vậy, khi dùng nguyên `.env.example`, giá trị `REQUEST_SLEEP_MIN_SECONDS=0.8`
+sẽ được nâng lên `1.0` lúc chạy.
+
+### Overnight và đường dẫn
+
+| Biến | Giá trị trong `.env.example` | Ý nghĩa |
+|---|---:|---|
+| `DEFAULT_MATCH_COUNT` | `10` | Số match ID mặc định cho mỗi PUUID |
+| `OVERNIGHT_TARGET_MATCHES` | `20000` | Mục tiêu match mới |
+| `OVERNIGHT_HOURS` | `8` | Thời gian chạy tối đa |
+| `OVERNIGHT_BATCH_SIZE` | `1000` | Số match mới trước khi process và nghỉ |
+| `OVERNIGHT_BATCH_SLEEP_MIN_SECONDS` | `480` | Nghỉ batch tối thiểu |
+| `OVERNIGHT_BATCH_SLEEP_MAX_SECONDS` | `900` | Nghỉ batch tối đa |
+| `OVERNIGHT_LEADERBOARD_LIMIT_PER_TIER` | `50` | Số seed tối đa trên mỗi tier |
+| `OVERNIGHT_MATCH_COUNT_PER_PUUID` | `20` | Kích thước trang match history |
+| `OVERNIGHT_INCLUDE_TIMELINES` | `true` | Có thu timeline trong overnight hay không |
+| `OVERNIGHT_TIERS` | `CHALLENGER,...,DIAMOND:I` | Kế hoạch tier để lấy seed |
+| `OUTPUT_DIR` | `output` | Thư mục dữ liệu |
+| `CHECKPOINT_DIR` | `checkpoints` | Thư mục checkpoint |
+| `LOG_DIR` | `logs` | Thư mục log |
+| `LOG_LEVEL` | `INFO` | Mức log |
+
+`OVERNIGHT_BATCH_SIZE` được ép trong khoảng `100` đến `1200`, còn thời gian nghỉ
+tối thiểu giữa các batch được ép ít nhất `480` giây.
+
+## Cách sử dụng
+
+CLI có bốn subcommand:
+
+```text
+crawl-puuids
+crawl-leaderboard
+crawl-overnight
+process
+```
+
+Sau mỗi lệnh crawl hoàn tất, chương trình tự chạy bước tạo CSV.
+
+### 1. Crawl theo PUUID
+
+Thu thập summoner, ranked entry, match detail và timeline cho một hoặc nhiều
+PUUID:
 
 ```bash
 python main.py crawl-puuids \
   --puuids <PUUID_1> <PUUID_2> \
   --platform-region vn2 \
   --match-count 20
+```
 
-# Skip ranked and timeline collection
+Chỉ lấy match detail, bỏ ranked và timeline:
+
+```bash
 python main.py crawl-puuids \
-  --puuids <PUUID_1> \
-  --platform-region vn2 \
+  --puuids <PUUID> \
   --skip-ranked \
   --skip-timelines
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--puuids` | *(required)* | One or more Riot PUUIDs |
-| `--platform-region` | env default | Platform shard: `vn2`, `kr`, `euw1`, `na1` |
-| `--routing-region` | auto | Match-V5 route: `sea`, `asia`, `europe`, `americas` |
-| `--match-count` | env default | Match IDs to request per PUUID |
-| `--start` | `0` | Match history offset |
-| `--queue` | None | Riot queue ID filter (e.g. `420` for Ranked Solo) |
-| `--skip-ranked` | `false` | Skip ranked endpoint |
-| `--skip-timelines` | `false` | Skip timeline collection |
-
----
-
-### crawl-leaderboard
-
-Seed from Riot's ranked leaderboard and crawl recent matches for discovered players.
+Lọc Ranked Solo/Duo bằng queue ID `420`:
 
 ```bash
-# Crawl top 50 Challenger players, 20 matches each
+python main.py crawl-puuids \
+  --puuids <PUUID> \
+  --queue 420 \
+  --match-count 20
+```
+
+| Tham số | Mặc định | Mô tả |
+|---|---|---|
+| `--puuids` | bắt buộc | Một hoặc nhiều PUUID |
+| `--platform-region` | `.env` | Platform shard |
+| `--routing-region` | tự ánh xạ | Match-V5 routing region |
+| `--match-count` | `DEFAULT_MATCH_COUNT` | Số match ID trên mỗi PUUID |
+| `--start` | `0` | Offset trong lịch sử đấu |
+| `--queue` | không lọc | Riot queue ID |
+| `--skip-ranked` | tắt | Không gọi ranked endpoint |
+| `--skip-timelines` | tắt | Không thu timeline |
+
+Lưu ý: timeline trong lệnh này chỉ được gọi cho các match detail vừa tải mới.
+Nếu raw match đã tồn tại nhưng timeline tương ứng bị thiếu, match sẽ bị skip và
+timeline đó không được tự backfill bởi lệnh `crawl-puuids`.
+
+### 2. Crawl từ leaderboard
+
+Lấy người chơi từ một tier:
+
+```bash
 python main.py crawl-leaderboard \
   --platform-region vn2 \
   --tier CHALLENGER \
   --limit 50 \
   --match-count 20
+```
 
-# Crawl all top tiers (Challenger + Grandmaster + Master + Diamond I)
+Lấy seed theo toàn bộ kế hoạch `OVERNIGHT_TIERS`:
+
+```bash
 python main.py crawl-leaderboard \
   --platform-region vn2 \
   --tier ALL \
@@ -181,270 +352,317 @@ python main.py crawl-leaderboard \
   --match-count 20
 ```
 
-| Flag | Default | Description |
+Với `--tier ALL` hoặc `TOP`, `--limit` được áp dụng cho từng tier, không phải
+tổng số người chơi của tất cả tier.
+
+| Tham số | Mặc định | Mô tả |
 |---|---|---|
-| `--platform-region` | env default | Platform shard |
-| `--routing-region` | auto | Match-V5 route |
-| `--queue` | `RANKED_SOLO_5x5` | Ranked queue type |
-| `--tier` | `ALL` | `ALL`, `CHALLENGER`, `GRANDMASTER`, `MASTER`, `DIAMOND`, etc. |
-| `--division` | `I` | Division for non-apex tiers |
-| `--limit` | `25` | Max leaderboard players to resolve |
-| `--match-count` | env default | Matches to crawl per player |
-| `--skip-timelines` | `false` | Skip timeline collection |
+| `--platform-region` | `.env` | Platform shard |
+| `--routing-region` | tự ánh xạ | Match-V5 routing region |
+| `--queue` | `RANKED_SOLO_5x5` | Loại ranked queue |
+| `--tier` | `ALL` | Tier hoặc `ALL`/`TOP` |
+| `--division` | `I` | Division cho tier thường |
+| `--limit` | `25` | Số entry tối đa trên mỗi leaderboard được đọc |
+| `--match-count` | `DEFAULT_MATCH_COUNT` | Số match trên mỗi PUUID |
+| `--skip-timelines` | tắt | Không thu timeline |
 
----
+### 3. Crawl qua đêm
 
-### crawl-overnight
+Chế độ này:
 
-Safe batched overnight crawl, restricted to VN2. Respects a hard time deadline and stops gracefully if the target match count is reached early.
+- Chỉ chấp nhận `--platform-region vn2`.
+- Duyệt seed theo vòng tròn và tăng offset lịch sử đấu sau mỗi lượt.
+- Dừng khi đạt mục tiêu match mới hoặc hết thời gian.
+- Process CSV sau mỗi batch.
+- Nghỉ ngẫu nhiên giữa các batch nếu deadline còn đủ xa.
+
+Ví dụ thu cả match detail và timeline:
 
 ```bash
-# Run for 8 hours, targeting 4000 new matches
-python main.py crawl-overnight --hours 8 --target-matches 4000
-
-# Using the PowerShell wrapper (Windows)
-.\overnight_crawl.ps1
-
-# Seed from specific tiers only
-python main.py crawl-overnight \
-  --hours 10 \
-  --target-matches 5000 \
-  --tiers CHALLENGER GRANDMASTER MASTER DIAMOND:I \
-  --leaderboard-limit 50
-
-# Seed from known PUUIDs instead of leaderboard discovery
 python main.py crawl-overnight \
   --hours 8 \
-  --target-matches 4000 \
+  --target-matches 8000 \
+  --platform-region vn2
+```
+
+Chỉ thu match detail:
+
+```bash
+python main.py crawl-overnight \
+  --hours 8 \
+  --target-matches 15000 \
+  --skip-timelines
+```
+
+Tùy chỉnh tier:
+
+```bash
+python main.py crawl-overnight \
+  --hours 10 \
+  --target-matches 10000 \
+  --tiers CHALLENGER GRANDMASTER MASTER DIAMOND:I \
+  --leaderboard-limit 50
+```
+
+Dùng PUUID có sẵn thay cho leaderboard discovery:
+
+```bash
+python main.py crawl-overnight \
+  --hours 8 \
+  --target-matches 10000 \
   --puuids <PUUID_1> <PUUID_2>
 ```
 
-| Flag | Default | Description |
+| Tham số | Mặc định | Mô tả |
 |---|---|---|
-| `--hours` | env default | Max runtime in hours |
-| `--target-matches` | env default | Target new matches to save |
-| `--platform-region` | `vn2` | Locked to VN2 |
-| `--leaderboard-limit` | env default | Seed players per tier |
-| `--match-count` | env default | Match IDs requested per player per page |
-| `--batch-size` | env default | New matches per batch before sleeping |
-| `--batch-sleep-min` | env default | Min inter-batch sleep (seconds) |
-| `--batch-sleep-max` | env default | Max inter-batch sleep (seconds) |
-| `--tiers` | env default | Tier plan, e.g. `CHALLENGER GRANDMASTER DIAMOND:I` |
-| `--puuids` | None | Optional seed PUUIDs (skips leaderboard discovery) |
-| `--queue` | `RANKED_SOLO_5x5` | Queue for leaderboard seeding |
-| `--match-queue` | None | Riot queue ID filter applied to match fetching |
-| `--skip-timelines` | `false` | Skip timeline collection |
+| `--hours` | `OVERNIGHT_HOURS` | Thời gian chạy tối đa |
+| `--target-matches` | `OVERNIGHT_TARGET_MATCHES` | Mục tiêu match mới |
+| `--platform-region` | `vn2` | Chỉ `vn2` được hỗ trợ |
+| `--leaderboard-limit` | `.env` | Seed tối đa trên mỗi tier |
+| `--match-count` | `.env` | Kích thước trang lịch sử mỗi PUUID |
+| `--batch-size` | `.env` | Match mới trên mỗi batch |
+| `--batch-sleep-min` | `.env` | Thời gian nghỉ batch tối thiểu |
+| `--batch-sleep-max` | `.env` | Thời gian nghỉ batch tối đa |
+| `--tiers` | `.env` | Danh sách tier; division dùng cú pháp `TIER:I` |
+| `--puuids` | không có | Seed trực tiếp, bỏ bước leaderboard |
+| `--queue` | `RANKED_SOLO_5x5` | Queue dùng để tìm seed |
+| `--match-queue` | không lọc | Queue ID dùng khi lấy match history |
+| `--skip-timelines` | tắt | Không thu timeline |
 
-> **Warning**: Passing `--target-matches` beyond the safe capacity for your runtime will log a warning. The crawler will stop at the time limit rather than exceed the configured rate.
+#### PowerShell wrapper
 
----
+```powershell
+.\overnight_safe.ps1
+```
 
-### process
+Script hiện tại:
 
-Rebuild all processed CSVs from existing raw JSON files. No API calls are made.
+- Đặt standby timeout khi cắm điện thành `0`.
+- Chạy `crawl-overnight` trong 8 giờ với mục tiêu 20.000 match.
+- Truyền `--skip-timelines`, nên chỉ thu match detail.
+- Ghi thêm một file log wrapper trong `logs/`.
+- Chạy lại `process` sau crawl.
+- Khôi phục standby timeout khi cắm điện về 15 phút.
+
+Trước khi dùng trên máy khác, cần sửa đường dẫn `cd
+D:\Project\Riot-esports-data-ingestion` đang được ghi cố định trong script.
+Lệnh `powercfg` cũng có thể yêu cầu mở PowerShell với quyền phù hợp.
+
+### 4. Dựng lại CSV
 
 ```bash
 python main.py process
 ```
 
-This is automatically called after each overnight batch and at the end of any crawl command.
+Lệnh này chỉ đọc `output/raw/**/*.json`, không khởi tạo `RiotClient`, không cần
+API key và không gọi mạng. JSON lỗi hoặc không đúng schema sẽ được bỏ qua và ghi
+vào log.
 
----
+## Dữ liệu đầu ra
 
-## Architecture & Data Flow
+### Raw JSON
 
-```
-Riot Ranked API
-      │
-      ▼
- Leaderboard entries ──► PUUIDs (deduplicated seed list)
-                               │
-                               ▼
-                     Match IDs per PUUID
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-              Checkpoint              Raw file
-               check                   check
-                    └──────────┬──────────┘
-                               │ (skip if already saved)
-                               ▼
-                     Riot Match Detail API
-                               │
-                               ▼
-                  output/raw/matches/<id>.json
-                               │
-                               ▼
-                     Checkpoint updated
-                               │
-                               ▼
-                     Riot Timeline API
-                               │
-                               ▼
-                 output/raw/timelines/<id>.json
-                               │
-                               ▼
-                     Checkpoint updated
-                               │
-                               ▼
-                    process_raw_to_csv()
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-             players.csv           matches.csv
-             ranked.csv           timelines.csv
+| Đường dẫn | Nội dung |
+|---|---|
+| `output/raw/summoners/*.json` | Phản hồi Summoner-V4 |
+| `output/raw/ranked/*.json` | Ranked entry hoặc leaderboard League-V4 |
+| `output/raw/matches/*.json` | Match detail Match-V5 |
+| `output/raw/timelines/*.json` | Timeline Match-V5 |
+
+Raw payload được lưu với định dạng UTF-8, indent và key được sắp xếp. Các model
+Pydantic cho phép field ngoài schema để không làm mất dữ liệu Riot bổ sung.
+
+### `players.csv`
+
+Mỗi dòng là một người chơi trong một trận:
+
+```text
+match_id, participant_id, puuid, summoner_name,
+riot_id_game_name, riot_id_tagline,
+champion_id, champion_name,
+kills, deaths, assists, kda,
+damage_dealt, gold_earned, vision_score,
+win, team_id, position, team_position, individual_position
 ```
 
----
+`kda` được tính bằng `(kills + assists) / deaths`; nếu `deaths = 0`, giá trị là
+`kills + assists`.
 
-## Capacity Planning
+### `matches.csv`
 
-Each full match requires **at minimum 2 API requests** (Match Detail + Timeline). The safe overnight defaults use 20 requests/minute.
+Mỗi dòng là một trận:
 
-| Runtime | Requests | Estimated full matches (with timelines) |
-|---|---|---|
-| 8 hours | ~9,600 | ~4,300 |
-| 10 hours | ~12,000 | ~5,400 |
-| 12 hours | ~14,400 | ~6,500 |
+```text
+match_id, game_creation, game_start_timestamp, game_end_timestamp,
+game_duration, queue_id, game_version, map_id, platform_id,
+game_mode, game_type, winning_team, participant_count
+```
 
-> The 90% overhead factor accounts for leaderboard seeding, summoner lookups, and retry delays.
+### `ranked.csv`
 
-To reach 15,000–25,000 full matches per day:
-- Run longer windows (12–16 h)
-- Rotate keys responsibly between runs
-- Use an approved production key with documented higher limits
+Mỗi dòng là một ranked entry:
 
-The crawler **will not exceed the configured rate** to hit a target. It logs a warning and stops at the deadline instead.
+```text
+puuid, summoner_id, queue_type, tier, rank, league_points,
+wins, losses, win_rate, veteran, inactive, fresh_blood, hot_streak
+```
 
----
+`win_rate` được tính bằng `wins / (wins + losses)`.
 
-## Output Schema
+### `timelines.csv`
 
-### `output/processed/players.csv`
+Mỗi dòng là một event đã chuẩn hóa:
 
-Per-participant stats for each match.
+```text
+match_id, timestamp, participant_id, event_type, event_category, events,
+related_participant_id, position_x, position_y, item_id, skill_slot,
+monster_type, monster_sub_type, building_type, lane_type, ward_type,
+killer_id, victim_id, creator_id, assisting_participant_ids
+```
 
-| Column | Description |
-|---|---|
-| `match_id` | Riot match ID |
-| `participant_id` | In-game participant slot (1–10) |
-| `puuid` | Player PUUID |
-| `summoner_name` | Summoner name |
-| `riot_id_game_name` | Riot ID game name |
-| `riot_id_tagline` | Riot ID tagline |
-| `champion_id` | Champion numeric ID |
-| `champion_name` | Champion name |
-| `kills` / `deaths` / `assists` | KDA components |
-| `kda` | Computed KDA ratio |
-| `damage_dealt` | Total damage dealt to champions |
-| `gold_earned` | Total gold earned |
-| `vision_score` | Vision score |
-| `win` | Boolean win/loss |
-| `team_id` | Team (100 or 200) |
-| `position` | Assigned position |
-| `team_position` | Team-relative position |
-| `individual_position` | Individually computed position |
+Event `CHAMPION_KILL` được tách thành nhiều dòng `kill`, `death` và `assist`.
+Các event phổ biến khác được chuẩn hóa thành `ward_place`, `objective`,
+`building`, `item_purchase`, `skill_level`, `level_up` và các category tương
+ứng.
 
----
+Tất cả CSV:
 
-### `output/processed/matches.csv`
+- Luôn có header, kể cả khi không có dữ liệu.
+- Được sắp xếp theo khóa định danh.
+- Được loại trùng theo khóa phù hợp với từng file.
+- Được ghi đè hoàn toàn mỗi lần chạy `process`.
 
-Match-level metadata.
+## Checkpoint và khả năng chạy lại
 
-| Column | Description |
-|---|---|
-| `match_id` | Riot match ID |
-| `game_creation` | Unix timestamp of game creation |
-| `game_start_timestamp` | Unix timestamp of game start |
-| `game_end_timestamp` | Unix timestamp of game end |
-| `game_duration` | Duration in seconds |
-| `queue_id` | Riot queue ID |
-| `game_version` | Patch version string |
-| `map_id` | Map ID |
-| `platform_id` | Platform shard (e.g. `VN2`) |
-| `game_mode` | Game mode string |
-| `game_type` | Game type string |
-| `winning_team` | Winning team ID (100 or 200) |
-| `participant_count` | Number of participants |
+Checkpoint nằm tại:
 
----
+```text
+checkpoints/matches.json
+checkpoints/timelines.json
+```
 
-### `output/processed/timelines.csv`
+Trước khi gọi match detail hoặc timeline, chương trình kiểm tra:
 
-One row per timeline event per match.
+1. Raw JSON tương ứng đã tồn tại hay chưa.
+2. Match ID đã có trong checkpoint hay chưa.
 
-| Column | Description |
-|---|---|
-| `match_id` | Riot match ID |
-| `timestamp` | Event timestamp (ms) |
-| `participant_id` | Participant involved |
-| `event_type` | Raw Riot event type string |
-| `event_category` | Normalized category |
-| `events` | Full event JSON blob |
-| `related_participant_id` | Secondary participant |
-| `position_x` / `position_y` | Map coordinates |
-| `item_id` | Item involved (if applicable) |
-| `skill_slot` | Skill leveled (if applicable) |
-| `monster_type` / `monster_sub_type` | Monster killed |
-| `building_type` / `lane_type` | Building destroyed |
-| `ward_type` | Ward placed/killed |
-| `killer_id` / `victim_id` / `creator_id` | Event actors |
-| `assisting_participant_ids` | Assist participant list |
+Chỉ khi cả hai đều chưa có thì request mới được gửi. Sau khi raw JSON được lưu
+và validate thành công, ID được ghi ngay vào checkpoint bằng file tạm rồi
+`replace`, giảm nguy cơ checkpoint bị ghi dở.
 
----
+Khi khởi động một lệnh crawl, `hydrate_from_raw_files()` quét raw match và
+timeline hiện có để bổ sung lại checkpoint. Vì vậy có thể xóa checkpoint và tạo
+lại từ raw data.
 
-### `output/processed/ranked.csv`
+Một raw payload không hợp lệ vẫn được giữ để điều tra, nhưng không được đánh dấu
+processed. Tuy nhiên, lần chạy sau vẫn skip request đó vì raw file đã tồn tại.
 
-Ranked ladder entry per player per queue.
+## Rate limit, retry và ước tính công suất
 
-| Column | Description |
-|---|---|
-| `puuid` | Player PUUID |
-| `summoner_id` | Encrypted summoner ID |
-| `queue_type` | Queue string (e.g. `RANKED_SOLO_5x5`) |
-| `tier` | Tier (e.g. `CHALLENGER`) |
-| `rank` | Division (e.g. `I`) |
-| `league_points` | Current LP |
-| `wins` / `losses` | Season win/loss counts |
-| `win_rate` | Computed win rate |
-| `veteran` / `inactive` / `fresh_blood` / `hot_streak` | Ladder flags |
+Limiter quản lý đồng thời:
 
----
+- Semaphore toàn cục.
+- Semaphore theo region.
+- Cửa sổ 60 giây toàn cục.
+- Cửa sổ 60 giây theo region.
+- Cửa sổ 60 giây theo method.
+- Khoảng nghỉ ngẫu nhiên giữa các request.
 
-## Incremental Guarantees
+Khi nhận `429`, throughput theo region giảm và cooldown được áp dụng theo
+`Retry-After` hoặc backoff. Khi header Riot cho thấy mức sử dụng từ 85% trở lên,
+client chủ động giảm tốc trong thời gian ngắn.
 
-The crawler avoids duplicate API calls through two independent checks before every request:
+Chế độ overnight dùng công thức ước tính:
 
-**Match Detail:**
-1. File exists at `output/raw/matches/<match_id>.json`
-2. `match_id` present in `checkpoints/matches.json`
+```text
+capacity = hours * 60 * requests_per_minute * 0.9 / requests_per_match
+```
 
-**Timeline:**
-1. File exists at `output/raw/timelines/<match_id>.json`
-2. `match_id` present in `checkpoints/timelines.json`
+Trong đó `requests_per_match` bằng `2` khi có timeline và `1` khi bỏ timeline.
+Đây chỉ là trần lý thuyết của phần match/timeline. Thực tế còn request
+leaderboard, summoner, retry, timeline delay, batch sleep, match trùng và thời
+gian xử lý CSV.
 
-Both checks must fail for a request to be issued. After each successful raw file save, the checkpoint is updated **immediately** (not deferred to the end of a batch). This means an interrupted run can be safely resumed from exactly where it stopped — no data is lost and no API quota is wasted.
+Nếu mục tiêu vượt ước tính, crawler chỉ ghi warning và vẫn ưu tiên dừng theo
+deadline; chương trình không tăng tốc để cố đạt mục tiêu.
 
-On startup, `CheckpointManager.hydrate_from_raw_files()` scans existing raw files and back-fills the checkpoint sets, so the system stays consistent even if checkpoints are deleted.
+## Kiểm thử
 
----
-
-## Testing
+Chạy toàn bộ test:
 
 ```bash
 pytest -q
 ```
 
-Test configuration lives in `pytest.ini`. Tests cover the rate limiter, checkpoint manager, schema validation, and CSV output logic.
+Các test hiện có kiểm tra:
 
----
+- Rate limiter hoàn thành request slot và ép ngưỡng không an toàn.
+- Checkpoint skip raw match đã tồn tại.
+- Checkpoint ghi nhận match mới.
+- Chuyển đổi match thành match/player record.
+- Tách timeline kill thành kill/death/assist.
+- Validate summoner payload không có encrypted summoner ID.
 
-## Contributing
+Trạng thái tại lần rà soát README:
 
-1. Fork the repo and create a feature branch
-2. Follow the existing module structure under `crawler/`
-3. Add or update tests for any changed behaviour
-4. Run `pytest -q` and confirm all tests pass
-5. Open a pull request with a clear description of the change
+```text
+7 passed
+```
 
-Please do not commit real API keys. The `.gitignore` excludes `.env`, `output/`, `logs/`, and `checkpoints/` by default.
+Test hiện tại không gọi Riot API thật và chưa bao phủ end-to-end network crawl.
+
+## Xử lý sự cố
+
+### `RIOT_API_KEY is required`
+
+Đảm bảo `.env` tồn tại ở thư mục gốc và có:
+
+```env
+RIOT_API_KEY=RGAPI-...
+```
+
+Development key của Riot thường có thời hạn ngắn; thay key mới không ảnh hưởng
+raw data hoặc checkpoint.
+
+### HTTP `401` hoặc `403`
+
+- Kiểm tra key đã hết hạn hay chưa.
+- Kiểm tra sản phẩm API có quyền truy cập endpoint cần dùng.
+- Không thêm dấu nháy hoặc khoảng trắng thừa vào key.
+
+### HTTP `429`
+
+Crawler sẽ tự cooldown và retry. Nếu lỗi lặp lại:
+
+- Giảm `REQUESTS_PER_MINUTE`.
+- Giảm `METHOD_REQUESTS_PER_MINUTE`.
+- Tăng khoảng nghỉ request.
+- Tránh chạy nhiều tiến trình crawler dùng cùng API key.
+
+### CSV rất chậm hoặc tốn RAM
+
+`process` hiện đọc toàn bộ JSON cần thiết vào bộ nhớ và dùng pandas để dựng lại
+toàn bộ CSV. Với dataset lớn:
+
+- Đảm bảo còn đủ RAM và dung lượng đĩa.
+- Chạy `process` riêng sau khi crawl thay vì quá thường xuyên.
+- Có thể dùng `--skip-timelines` nếu không cần phân tích event.
+
+### Tên người chơi bị lỗi ký tự khi mở CSV
+
+CSV được ghi UTF-8. Hãy chọn UTF-8 khi import vào Excel hoặc công cụ BI thay vì
+để phần mềm tự đoán encoding.
+
+### Raw có nhưng CSV thiếu record
+
+Kiểm tra log của lệnh `process`. Payload sai JSON hoặc không đáp ứng schema
+Pydantic sẽ bị bỏ qua, nhưng raw file vẫn được giữ để điều tra.
+
+## Lưu ý bảo mật và sử dụng API
+
+- Không commit `.env` hoặc API key thật.
+- Không đưa API key vào command line, log hoặc ảnh chụp màn hình.
+- Tuân thủ Riot Games API Terms, rate limit và chính sách sử dụng dữ liệu.
+- Không chạy nhiều instance với cùng key nếu chưa điều phối rate limit chung.
+- Repository hiện không có file `LICENSE`; không nên mặc định mã nguồn đã được
+  cấp giấy phép sử dụng lại chỉ dựa trên việc repository có thể truy cập.
